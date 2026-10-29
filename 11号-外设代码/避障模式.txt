@@ -1,0 +1,197 @@
+避障模式
+// 引脚定义
+const int LEFT_F_PIN = 9;
+const int LEFT_B_PIN = 10;
+const int RIGHT_F_PIN = 5;
+const int RIGHT_B_PIN = 6;
+const int TRIG_PIN = 13;
+const int ECHO_PIN = 12;
+
+// 避障相关变量
+unsigned long lastMeasureTime = 0;
+unsigned long obstacleActionTime = 0;
+unsigned long longModeTimer = 0; 
+bool isBackwardMode = false;
+bool isLongDistanceMode = false; // 长模式标记（初始化为false，确保默认短模式）
+float currentDistance = 0;
+
+// 速度/距离参数
+const int SHORT_SAFE_SPEED = 60;   // 短模式＞60cm速度
+const int SHORT_WARN_SPEED = 35;   // 短模式40-60cm速度
+const int SHORT_ALERT_SPEED = 30;  // 短模式10-40cm速度
+const int SHORT_EMERGENCY_DIST = 8;// 短模式紧急避障阈值（≤8cm后退）
+const int LONG_MODE_DUR = 1000;    // 长模式触发：＞60cm持续1秒
+
+// ========================== 电机控制函数 ==========================
+void moveCar(int leftSpeed, bool leftForward, int rightSpeed, bool rightForward) {
+  analogWrite(LEFT_F_PIN, leftForward ? leftSpeed : 0);
+  analogWrite(LEFT_B_PIN, leftForward ? 0 : leftSpeed);
+  analogWrite(RIGHT_F_PIN, rightForward ? 0 : rightSpeed);
+  analogWrite(RIGHT_B_PIN, rightForward ? rightSpeed : 0);
+}
+
+void forward(int speed) {
+  moveCar(speed, true, speed, true);
+}
+
+void backward(int speed = 50) {
+  moveCar(speed, false, speed, false);
+}
+
+void turnLeft(int leftSpeed = 40, int rightSpeed = 120) {
+  moveCar(leftSpeed, false, rightSpeed, true);
+}
+
+void stopCar() {
+  analogWrite(LEFT_F_PIN, 0);
+  analogWrite(LEFT_B_PIN, 0);
+  analogWrite(RIGHT_F_PIN, 0);
+  analogWrite(RIGHT_B_PIN, 0);
+}
+
+// ========================== 超声波测距 ==========================
+float measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH, 20000);
+  float distance = duration > 0 ? (duration * 0.034 / 2) : 0;
+  return constrain(distance, 0, 400);
+}
+
+bool isTimeReached(unsigned long startTime, unsigned long targetTime) {
+  return millis() - startTime >= targetTime;
+}
+
+// ========================== 长模式触发检测（仅负责标记，不执行动作）==========================
+void checkLongDistanceMode() {
+  // 仅在「未避障+未触发长模式」时检测触发条件
+  if (!isBackwardMode && !isLongDistanceMode) {
+    if (currentDistance >= 60) {
+      if (longModeTimer == 0) {
+        longModeTimer = millis();
+        Serial.println("长模式计时开始：＞60cm");
+      } else if (isTimeReached(longModeTimer, LONG_MODE_DUR)) {
+        isLongDistanceMode = true;
+        Serial.println("=== 切换：长距离模式 ===");
+      }
+    } else {
+      // 短模式下离开60cm，立即重置计时（避免误触发）
+      longModeTimer = 0;
+    }
+  }
+}
+
+// ========================== 避障核心逻辑（长短模式彻底隔离）=========================
+void obstacleAvoidAction() {
+  // 1. 刷新测距（优先执行，确保距离准确）
+  if (isTimeReached(lastMeasureTime, 50)) {
+    currentDistance = measureDistance();
+    lastMeasureTime = millis();
+  }
+
+  // 2. 仅在未避障时检测长模式（避障中不切换模式）
+  if (!isBackwardMode) {
+    checkLongDistanceMode();
+  }
+
+  // 3. 串口打印当前状态（便于调试）
+  Serial.print("距离:");
+  Serial.print(currentDistance, 1);
+  Serial.print("cm | 模式:");
+  Serial.println(isLongDistanceMode ? "长距离" : "短距离");
+
+  // ====================== 核心：长短模式完全隔离 ======================
+  // 避障中（后退/左转），不执行任何模式的前进逻辑
+  if (isBackwardMode) {
+    if (isTimeReached(obstacleActionTime, 1500)) {
+      // 后退1.5秒完成，执行左转
+      stopCar();
+      delay(100);
+      turnLeft();
+      Serial.println("后退完成，开始左转1.5秒");
+      obstacleActionTime = millis();
+      
+      // 等待左转完成
+      while (!isTimeReached(obstacleActionTime, 1500)) {
+        delay(10);
+      }
+      
+      // 左转完成，重置所有标记（关键：强制切回短模式）
+      stopCar();
+      isBackwardMode = false;
+      longModeTimer = 0;
+      isLongDistanceMode = false; // 强制重置长模式
+      Serial.println("=== 左转完成，强制切回短距离模式 ===");
+    } else {
+      // 继续后退
+      backward();
+    }
+  } 
+  // 长距离模式（仅长模式标记为true时执行）
+  else if (isLongDistanceMode) {
+    if (currentDistance > 60) {
+      forward(SHORT_SAFE_SPEED);
+      Serial.println("长模式：＞60cm → 满速前进");
+    } else if (currentDistance > 0) {
+      // 长模式≤60cm，直接后退
+      isBackwardMode = true;
+      obstacleActionTime = millis();
+      backward();
+      Serial.print("长模式：");
+      Serial.print(currentDistance, 1);
+      Serial.println("cm（≤60cm）→ 直接后退");
+    }
+  } 
+  // 短距离模式（仅长模式标记为false时执行，彻底隔离）
+  else {
+    if (currentDistance > 60) {
+      forward(SHORT_SAFE_SPEED);
+      Serial.println("短模式：＞60cm → 满速前进");
+    } else if (currentDistance > 40) {
+      forward(SHORT_WARN_SPEED);
+      Serial.println("短模式：40-60cm → 35速前进");
+    } else if (currentDistance > SHORT_EMERGENCY_DIST) {
+      forward(SHORT_ALERT_SPEED);
+      Serial.println("短模式：8-40cm → 30速前进");
+    } else if (currentDistance <= SHORT_EMERGENCY_DIST && currentDistance > 0) {
+      // 短模式仅≤8cm后退
+      isBackwardMode = true;
+      obstacleActionTime = millis();
+      backward();
+      Serial.println("短模式：≤8cm → 紧急后退");
+    }
+  }
+}
+
+// ========================== 初始化 ==========================
+void setup() {
+  Serial.begin(9600);
+  
+  // 引脚初始化
+  pinMode(LEFT_F_PIN, OUTPUT);
+  pinMode(LEFT_B_PIN, OUTPUT);
+  pinMode(RIGHT_F_PIN, OUTPUT);
+  pinMode(RIGHT_B_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // 强制初始化所有标记（关键：避免随机值导致误判）
+  isBackwardMode = false;
+  isLongDistanceMode = false;
+  longModeTimer = 0;
+  
+  stopCar();
+  Serial.println("【最终版】长短距离模式启动（彻底隔离）");
+  Serial.println("短模式规则：＞60cm满速 | 40-60cm35速 | 8-40cm30速 | ≤8cm后退");
+  Serial.println("长模式规则：＞60cm满速 | ≤60cm直接后退（仅＞60cm持续1秒触发）");
+}
+
+// ========================== 主循环 ==========================
+void loop() {
+  obstacleAvoidAction();
+  delay(10);
+}

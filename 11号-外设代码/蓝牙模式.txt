@@ -1,0 +1,234 @@
+#include <SoftwareSerial.h>
+
+// ==================== 蓝牙模式相关引脚定义 ====================
+// 电机引脚（蓝牙控制小车运动依赖）
+const int LEFT_F_PIN = 9;
+const int LEFT_B_PIN = 10;
+const int RIGHT_F_PIN = 5;
+const int RIGHT_B_PIN = 6;
+
+// 蓝牙/外设引脚
+const int BUZZER_PIN = 14;
+const int LED_L = 11;
+const int LED_R = 3;
+const int BLUETOOTH_RX = A4;
+const int BLUETOOTH_TX = A5;
+const int KEY1_PIN = 2;
+
+// ==================== 蓝牙模式相关状态定义 ====================
+struct SharedState {
+  // 车灯状态变量
+  bool leftLedState = false;
+  bool rightLedState = false;
+  bool bothLedState = false;
+  
+  // 音乐相关变量
+  bool isPlaying = false;
+  int noteIndex = 0;
+  unsigned long lastNoteTime = 0;
+};
+
+SharedState state;
+
+// ==================== 简化的音乐数据（《伯虎说》） ====================
+const int BOHU_NOTE_COUNT = 16;
+const int bohuNotes[] PROGMEM = {294,330,392,330,440,494,440,392,440,494,440,659,587,494,587,494};
+const int bohuDurations[] PROGMEM = {300,300,300,300,300,300,300,300,300,300,600,300,300,300,300,300};
+
+// ==================== 蓝牙串口对象 ====================
+SoftwareSerial bluetoothSerial(BLUETOOTH_RX, BLUETOOTH_TX);
+
+// ==================== 蓝牙模式依赖的电机控制函数 ====================
+void moveCar(int leftSpeed, bool leftForward, int rightSpeed, bool rightForward) {
+  analogWrite(LEFT_F_PIN, leftForward ? leftSpeed : 0);
+  analogWrite(LEFT_B_PIN, leftForward ? 0 : leftSpeed);
+  analogWrite(RIGHT_F_PIN, rightForward ? 0 : rightSpeed);
+  analogWrite(RIGHT_B_PIN, rightForward ? rightSpeed : 0);
+}
+
+void forward(int speed = 50) {
+  moveCar(speed, true, speed, true);
+}
+
+void backward(int speed = 40) {
+  moveCar(speed, false, speed, false);
+}
+
+void turnLeft(int leftSpeed = 120, int rightSpeed = 200) {
+  moveCar(leftSpeed, false, rightSpeed, true);
+}
+
+void turnRight(int leftSpeed = 200, int rightSpeed = 120) {
+  moveCar(leftSpeed, true, rightSpeed, false);
+}
+
+void stopCar() {
+  analogWrite(LEFT_F_PIN, 0);
+  analogWrite(LEFT_B_PIN, 0);
+  analogWrite(RIGHT_F_PIN, 0);
+  analogWrite(RIGHT_B_PIN, 0);
+}
+
+// ==================== 蓝牙模式工具函数 ====================
+bool isTimeReached(unsigned long startTime, unsigned long targetTime) {
+  return millis() - startTime >= targetTime;
+}
+
+void setLedBrightness(int leftBright, int rightBright) {
+  analogWrite(LED_L, leftBright);
+  analogWrite(LED_R, rightBright);
+}
+
+void setBuzzer(int frequency, unsigned long duration = 0) {
+  if (frequency == 0) {
+    noTone(BUZZER_PIN);
+  } else if (duration == 0) {
+    tone(BUZZER_PIN, frequency);
+  } else {
+    tone(BUZZER_PIN, frequency, duration);
+  }
+}
+
+// ==================== 蓝牙车灯控制 ====================
+void ledToggleControl(char cmd) {
+  switch(cmd) {
+    case 'A':
+      state.leftLedState = !state.leftLedState;
+      setLedBrightness(state.leftLedState ? 255 : 0, state.rightLedState ? 255 : 0);
+      Serial.println(state.leftLedState ? "左灯已打开" : "左灯已关闭");
+      bluetoothSerial.println(state.leftLedState ? "OK:A_ON" : "OK:A_OFF");
+      break;
+    case 'B':
+      state.rightLedState = !state.rightLedState;
+      setLedBrightness(state.leftLedState ? 255 : 0, state.rightLedState ? 255 : 0);
+      Serial.println(state.rightLedState ? "右灯已打开" : "右灯已关闭");
+      bluetoothSerial.println(state.rightLedState ? "OK:B_ON" : "OK:B_OFF");
+      break;
+    case 'C':
+      state.bothLedState = !state.bothLedState;
+      state.leftLedState = state.bothLedState;
+      state.rightLedState = state.bothLedState;
+      setLedBrightness(state.bothLedState ? 255 : 0, state.bothLedState ? 255 : 0);
+      Serial.println(state.bothLedState ? "双灯已打开" : "双灯已关闭");
+      bluetoothSerial.println(state.bothLedState ? "OK:C_ON" : "OK:C_OFF");
+      break;
+  }
+  if (!state.isPlaying) setBuzzer(1000, 100);
+}
+
+// ==================== 《伯虎说》音乐播放（蓝牙指令触发） ====================
+void playBohuShuo() {
+  if (state.isPlaying) {
+    if (isTimeReached(state.lastNoteTime, pgm_read_word(&bohuDurations[state.noteIndex]))) {
+      state.noteIndex++;
+      if (state.noteIndex >= BOHU_NOTE_COUNT) {
+        state.isPlaying = false;
+        state.noteIndex = 0;
+        setBuzzer(0);
+        Serial.println("伯虎说播放完毕");
+        bluetoothSerial.println("OK:BohuShuo_Finish");
+      } else {
+        int note = pgm_read_word(&bohuNotes[state.noteIndex]);
+        note == 0 ? setBuzzer(0) : setBuzzer(note);
+        state.lastNoteTime = millis();
+      }
+    }
+  } else {
+    setBuzzer(0);
+  }
+}
+
+// ==================== 蓝牙指令核心处理函数 ====================
+void processBluetoothCommand(char cmd) {
+  switch(cmd) {
+    // 车灯控制指令
+    case 'A': case 'B': case 'C':
+      ledToggleControl(cmd);
+      break;
+    // 音乐播放指令
+    case 'D':
+      state.isPlaying = !state.isPlaying;
+      if (state.isPlaying) {
+        state.noteIndex = 0;
+        state.lastNoteTime = millis();
+        int note = pgm_read_word(&bohuNotes[state.noteIndex]);
+        note != 0 ? setBuzzer(note) : setBuzzer(0);
+        Serial.println("伯虎说开始播放");
+        bluetoothSerial.println("OK:BohuShuo_Play");
+      } else {
+        setBuzzer(0);
+        Serial.println("伯虎说停止播放");
+        bluetoothSerial.println("OK:BohuShuo_Stop");
+      }
+      break;
+    // 小车运动指令
+    case 'G': forward(); Serial.println("Forward"); break;
+    case 'K': backward(); Serial.println("Backward"); break;
+    case 'H': turnLeft(); Serial.println("TurnLeft"); break;
+    case 'J': turnRight(); Serial.println("TurnRight"); break;
+    case 'I': stopCar(); Serial.println("Stop"); break;
+    // 无效指令
+    default:
+      if (!state.isPlaying) setBuzzer(500, 200);
+      Serial.println("Invalid command");
+      bluetoothSerial.println("OK:Invalid_Cmd");
+      break;
+  }
+}
+
+// ==================== 蓝牙模式主处理逻辑 ====================
+void bluetoothModeLoop() {
+  // 音乐播放逻辑（持续运行）
+  if (state.isPlaying) {
+    playBohuShuo();
+  }
+  
+  // 处理串口/蓝牙串口指令
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') processBluetoothCommand(c);
+  }
+  if (bluetoothSerial.available()) {
+    char c = bluetoothSerial.read();
+    if (c != '\n' && c != '\r') processBluetoothCommand(c);
+  }
+}
+
+// ==================== 蓝牙模式初始化（可单独调用） ====================
+void bluetoothModeInit() {
+  Serial.begin(9600);
+  bluetoothSerial.begin(9600);
+  
+  // 引脚初始化
+  pinMode(LEFT_F_PIN, OUTPUT);
+  pinMode(LEFT_B_PIN, OUTPUT);
+  pinMode(RIGHT_F_PIN, OUTPUT);
+  pinMode(RIGHT_B_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_L, OUTPUT);
+  pinMode(LED_R, OUTPUT);
+  pinMode(KEY1_PIN, INPUT_PULLUP);
+  
+  // 初始状态
+  stopCar();
+  setLedBrightness(0, 0);
+  setBuzzer(0);
+  
+  Serial.println("系统启动：蓝牙控制模式");
+  Serial.println("蓝牙指令：A左灯 B右灯 C双灯 D音乐 G前进 K后退 H左转 J右转 I停止");
+  
+  // 启动提示音
+  setBuzzer(1500, 100);
+  delay(100);
+  setBuzzer(2000, 100);
+}
+
+// ==================== 独立的蓝牙模式主函数（可直接编译运行） ====================
+void setup() {
+  bluetoothModeInit();
+}
+
+void loop() {
+  bluetoothModeLoop();
+  delay(10);
+}

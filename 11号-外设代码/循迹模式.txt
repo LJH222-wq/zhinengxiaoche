@@ -1,0 +1,312 @@
+/*
+ * 反向循迹程序 - 白色=高电平(1)，黑色=低电平(0)
+ * 逻辑：躲避白线（高电平），向黑线（低电平）区域移动
+ * 四个传感器：左外(D15) 左中(D7) 右中(D4) 右外(D8)
+ * 注：高电平=白色，低电平=黑色
+ * 新增：90度直角转弯功能
+ */
+
+#include <MsTimer2.h>
+
+// ==================== 引脚定义 ====================
+const int irLeft = 15;        // 左外侧 D15（白色=1，黑色=0）
+const int irMiddleLeft = 7;   // 左中侧 D7
+const int irMiddleRight = 4;  // 右中侧 D4
+const int irRight = 8;        // 右外侧 D8
+
+const int LEFT_F_PIN = 9;     // 左电机前进
+const int LEFT_B_PIN = 10;    // 左电机后退
+const int RIGHT_F_PIN = 5;    // 右电机前进
+const int RIGHT_B_PIN = 6;    // 右电机后退
+
+// ==================== 参数设置 ====================
+// 基础速度
+const int BASE_SPEED = 25;    // 基础前进速度 (0-255)
+
+// 小幅度转弯参数
+const int SMALL_LEFT_L = 120;     // 小幅度左转左轮速度
+const int SMALL_LEFT_R = 225;    // 小幅度左转右轮速度
+const int SMALL_RIGHT_L = 225;   // 小幅度右转左轮速度
+const int SMALL_RIGHT_R = 120;    // 小幅度右转右轮速度
+
+// 90度转弯参数
+const int TURN_LEFT_L = 225;     // 左转左轮速度
+const int TURN_LEFT_R = 225;     // 左转右轮速度
+const int TURN_RIGHT_L = 225;    // 右转左轮速度
+const int TURN_RIGHT_R = 225;    // 右转右轮速度
+const int TURN_DURATION = 400;   // 转弯持续时间(ms)
+
+// ==================== 状态变量 ====================
+int irL, irML, irMR, irR;     // 传感器状态
+
+// 90度转弯状态变量
+bool is90DegreeTurning = false;       // 是否正在90度转弯
+int turn90Direction = 0;              // 0=无，1=左转，2=右转
+unsigned long turn90StartTime = 0;    // 转弯开始时间
+
+// ==================== 电机控制 ====================
+void moveCar(int leftSpeed, bool leftForward, int rightSpeed, bool rightForward) {
+  analogWrite(LEFT_F_PIN, leftForward ? leftSpeed : 0);
+  analogWrite(LEFT_B_PIN, leftForward ? 0 : leftSpeed);
+  analogWrite(RIGHT_F_PIN, rightForward ? 0 : rightSpeed);
+  analogWrite(RIGHT_B_PIN, rightForward ? rightSpeed : 0);
+}
+
+void forward(int speed = BASE_SPEED) {
+  moveCar(speed, true, speed, true);
+}
+
+// 小幅度左转
+void smallLeft() {
+  moveCar(SMALL_LEFT_L, false, SMALL_LEFT_R, true);
+}
+
+// 小幅度右转
+void smallRight() {
+  moveCar(SMALL_RIGHT_L, true, SMALL_RIGHT_R, false);
+}
+
+// 90度左转
+void turnLeft90() {
+  moveCar(TURN_LEFT_L, false, TURN_LEFT_R, true);
+}
+
+// 90度右转
+void turnRight90() {
+  moveCar(TURN_RIGHT_L, true, TURN_RIGHT_R, false);
+}
+
+void stopCar() {
+  analogWrite(LEFT_F_PIN, 0);
+  analogWrite(LEFT_B_PIN, 0);
+  analogWrite(RIGHT_F_PIN, 0);
+  analogWrite(RIGHT_B_PIN, 0);
+}
+
+// ==================== 传感器读取 ====================
+void readSensors() {
+  irL = digitalRead(irLeft);
+  irML = digitalRead(irMiddleLeft);
+  irMR = digitalRead(irMiddleRight);
+  irR = digitalRead(irRight);
+}
+
+// ==================== 90度转弯检测 ====================
+bool check90DegreeTurn() {
+  // 排除全黑（直行）和全白（停止）的情况
+  if (irL == 0 && irML == 0 && irMR == 0 && irR == 0) {
+    return false; // 全黑，直行
+  }
+  
+  if (irL == 1 && irML == 1 && irMR == 1 && irR == 1) {
+    return false; // 全白，停止
+  }
+  
+  // 情况1：左边两个传感器都为低电平 → 右转90度
+  if (irL == 0 && irML == 0) {
+    is90DegreeTurning = true;
+    turn90Direction = 2; // 右转
+    turn90StartTime = millis();
+    Serial.print("检测到90度转弯条件：左边两个黑 -> 右转90度 (");
+    Serial.print(irL);
+    Serial.print(irML);
+    Serial.print(irMR);
+    Serial.print(irR);
+    Serial.println(")");
+    return true;
+  }
+  
+  // 情况2：右边两个传感器都为低电平 → 左转90度
+  if (irMR == 0 && irR == 0) {
+    is90DegreeTurning = true;
+    turn90Direction = 1; // 左转
+    turn90StartTime = millis();
+    Serial.print("检测到90度转弯条件：右边两个黑 -> 左转90度 (");
+    Serial.print(irL);
+    Serial.print(irML);
+    Serial.print(irMR);
+    Serial.print(irR);
+    Serial.println(")");
+    return true;
+  }
+  
+  return false;
+}
+
+// ==================== 执行90度转弯 ====================
+void do90DegreeTurn() {
+  unsigned long elapsedTime = millis() - turn90StartTime;
+  
+  if (elapsedTime < TURN_DURATION) {
+    // 仍在转弯中
+    if (turn90Direction == 1) { // 左转
+      turnLeft90();
+      Serial.println("执行左90度转弯...");
+    } else if (turn90Direction == 2) { // 右转
+      turnRight90();
+      Serial.println("执行右90度转弯...");
+    }
+  } else {
+    // 转弯完成
+    stopCar();
+    delay(100); // 短暂停顿
+    is90DegreeTurning = false;
+    turn90Direction = 0;
+    Serial.println("90度转弯完成");
+  }
+}
+
+// ==================== 串口调整 ====================
+void checkSerialCommand() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    
+    if (command == "STATUS") {
+      Serial.println("=== 当前参数 ===");
+      Serial.print("基础前进速度: ");
+      Serial.print(BASE_SPEED);
+      Serial.println(" (0-255)");
+      
+      Serial.println("小幅度转弯参数:");
+      Serial.print("左转: L=");
+      Serial.print(SMALL_LEFT_L);
+      Serial.print(", R=");
+      Serial.print(SMALL_LEFT_R);
+      Serial.println();
+      
+      Serial.print("右转: L=");
+      Serial.print(SMALL_RIGHT_L);
+      Serial.print(", R=");
+      Serial.print(SMALL_RIGHT_R);
+      Serial.println();
+      
+      Serial.println("90度转弯参数:");
+      Serial.print("左转: L=");
+      Serial.print(TURN_LEFT_L);
+      Serial.print(", R=");
+      Serial.print(TURN_LEFT_R);
+      Serial.print(", 时间=");
+      Serial.print(TURN_DURATION);
+      Serial.println("ms");
+      
+      Serial.print("右转: L=");
+      Serial.print(TURN_RIGHT_L);
+      Serial.print(", R=");
+      Serial.print(TURN_RIGHT_R);
+      Serial.print(", 时间=");
+      Serial.print(TURN_DURATION);
+      Serial.println("ms");
+      
+      Serial.println("90度转弯触发条件:");
+      Serial.println("左边两个传感器都为低电平 -> 右转90度");
+      Serial.println("右边两个传感器都为低电平 -> 左转90度");
+      Serial.println("注：全黑(0000)直行，全白(1111)停止");
+    }
+    else if (command == "HELP") {
+      Serial.println("=== 可用命令 ===");
+      Serial.println("STATUS - 查看当前参数");
+      Serial.println("HELP - 显示帮助");
+    }
+  }
+}
+
+// ==================== 主循迹逻辑 ====================
+void traceLogic() {
+  readSensors();
+  
+  // 1. 如果正在90度转弯，优先处理
+  if (is90DegreeTurning) {
+    do90DegreeTurn();
+    return;
+  }
+  
+  // 2. 检查是否需要触发90度转弯
+  if (check90DegreeTurn()) {
+    return; // 已开始90度转弯，跳过其他逻辑
+  }
+  
+  // 打印传感器状态
+  Serial.print("传感器状态: ");
+  Serial.print(irL);
+  Serial.print(irML);
+  Serial.print(irMR);
+  Serial.print(irR);
+  Serial.print(" | ");
+  
+  // 3. 根据传感器状态执行相应动作
+  if (irL == 1 && irML == 1 && irMR == 1 && irR == 1) {
+    // 情况1：四个都为高电平（全是白色）
+    stopCar();
+    Serial.println("停止（四白）");
+  }
+  else if (irL == 0 && irML == 0 && irMR == 0 && irR == 0) {
+    // 情况2：四个都为低电平（全是黑色）
+    forward(BASE_SPEED);
+    Serial.println("直行（四黑）");
+  }
+  else if (irL == 0 && irML == 1 && irMR == 0 && irR == 0) {
+    // 情况3：D7为高电平，其他为低电平
+    smallLeft();
+    Serial.print("小幅度左转 L=");
+    Serial.print(SMALL_LEFT_L);
+    Serial.print(" R=");
+    Serial.println(SMALL_LEFT_R);
+  }
+  else if (irL == 0 && irML == 0 && irMR == 1 && irR == 0) {
+    // 情况4：D4为高电平，其他为低电平
+    smallRight();
+    Serial.print("小幅度右转 L=");
+    Serial.print(SMALL_RIGHT_L);
+    Serial.print(" R=");
+    Serial.println(SMALL_RIGHT_R);
+  }
+  else {
+    // 其他情况（多个高电平）：停止
+    stopCar();
+    Serial.println("停止（多白点）");
+  }
+}
+
+// ==================== 主程序 ====================
+void setup() {
+  Serial.begin(9600);
+  Serial.println("反向循迹程序启动（带90度转弯）");
+  Serial.println("传感器逻辑：白色=高电平(1)，黑色=低电平(0)");
+  Serial.println("=== 状态处理逻辑 ===");
+  Serial.println("1111 -> 停止（全白）");
+  Serial.println("0000 -> 直行（全黑）");
+  Serial.println("0100 -> 小幅度左转（左中白）");
+  Serial.println("0010 -> 小幅度右转（右中白）");
+  Serial.println("90度转弯条件：");
+  Serial.println("左边两个传感器都为低电平 -> 右转90度");
+  Serial.println("右边两个传感器都为低电平 -> 左转90度");
+  Serial.println("注：排除全黑(0000)和全白(1111)情况");
+  Serial.println("其他 -> 停止（多白点）");
+  Serial.println("输入 HELP 查看调整命令");
+  
+  // 引脚初始化
+  pinMode(irLeft, INPUT);
+  pinMode(irMiddleLeft, INPUT);
+  pinMode(irMiddleRight, INPUT);
+  pinMode(irRight, INPUT);
+  
+  pinMode(LEFT_F_PIN, OUTPUT);
+  pinMode(LEFT_B_PIN, OUTPUT);
+  pinMode(RIGHT_F_PIN, OUTPUT);
+  pinMode(RIGHT_B_PIN, OUTPUT);
+  
+  // 初始停止
+  stopCar();
+  delay(1000);
+  
+  // 启动定时器，每30ms执行一次循迹逻辑
+  MsTimer2::set(30, traceLogic);
+  MsTimer2::start();
+}
+
+void loop() {
+  // 检查串口命令
+  checkSerialCommand();
+  delay(10);
+}

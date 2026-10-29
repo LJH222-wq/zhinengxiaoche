@@ -1,0 +1,548 @@
+#include <SoftwareSerial.h>
+#include <MsTimer2.h>
+
+// ==================== 引脚定义 ====================
+// 电机引脚
+const int LEFT_F_PIN = 9;
+const int LEFT_B_PIN = 10;
+const int RIGHT_F_PIN = 5;
+const int RIGHT_B_PIN = 6;
+
+// 传感器引脚
+const int BUZZER_PIN = 14;
+const int LED_L = 11;
+const int LED_R = 3;
+const int BLUETOOTH_RX = A4;
+const int BLUETOOTH_TX = A5;
+const int TRIG_PIN = 13;
+const int ECHO_PIN = 12;
+const int KEY1_PIN = 2;
+
+// 循迹传感器引脚
+const int irLeft = 15;        // 左外侧 D15
+const int irMiddleLeft = 7;   // 左中侧 D7
+const int irMiddleRight = 4;  // 右中侧 D4
+const int irRight = 8;        // 右外侧 D8
+
+// ==================== 模式定义 ====================
+enum WorkMode { BLUETOOTH_MODE, OBSTACLE_AVOID_MODE, TRACK_MODE };
+WorkMode currentMode = BLUETOOTH_MODE;
+
+// ==================== 共享状态结构 ====================
+struct SharedState {
+  // 避障模式变量
+  unsigned long lastMeasureTime = 0;
+  unsigned long obstacleActionTime = 0;
+  unsigned long longModeTimer = 0; 
+  bool isBackwardMode = false;
+  bool isLongDistanceMode = false;
+  float currentDistance = 0;
+  
+  // 循迹模式变量
+  bool is90DegreeTurning = false;
+  int turn90Direction = 0;
+  unsigned long turn90StartTime = 0;
+  
+  // 车灯状态变量
+  bool leftLedState = false;
+  bool rightLedState = false;
+  bool bothLedState = false;
+  
+  // 音乐相关变量
+  bool isPlaying = false;
+  int noteIndex = 0;
+  unsigned long lastNoteTime = 0;
+};
+
+SharedState state;
+
+// ==================== 避障速度/距离参数 ====================
+const int SHORT_SAFE_SPEED = 60;
+const int SHORT_WARN_SPEED = 35;
+const int SHORT_ALERT_SPEED = 30;
+const int SHORT_EMERGENCY_DIST = 8;
+const int LONG_MODE_DUR = 1000;
+
+// ==================== 循迹参数 ====================
+const int TRACK_BASE_SPEED = 30;
+const int TRACK_SMALL_LEFT_L = 150;
+const int TRACK_SMALL_LEFT_R = 225;
+const int TRACK_SMALL_RIGHT_L = 225;
+const int TRACK_SMALL_RIGHT_R = 150;
+const int TRACK_TURN_LEFT_L = 225;
+const int TRACK_TURN_LEFT_R = 225;
+const int TRACK_TURN_RIGHT_L = 225;
+const int TRACK_TURN_RIGHT_R = 225;
+const int TRACK_TURN_DURATION = 190;
+
+// ==================== 简化的音乐数据（减少内存占用） ====================
+// 只保留《伯虎说》的前几个音符作为示例
+const int BOHU_NOTE_COUNT = 16; // 减少音符数量
+const int bohuNotes[] PROGMEM = {294,330,392,330,440,494,440,392,440,494,440,659,587,494,587,494};
+const int bohuDurations[] PROGMEM = {300,300,300,300,300,300,300,300,300,300,600,300,300,300,300,300};
+
+// ==================== 蓝牙串口对象 ====================
+SoftwareSerial bluetoothSerial(BLUETOOTH_RX, BLUETOOTH_TX);
+
+// ==================== 核心电机控制函数 ====================
+void moveCar(int leftSpeed, bool leftForward, int rightSpeed, bool rightForward) {
+  analogWrite(LEFT_F_PIN, leftForward ? leftSpeed : 0);
+  analogWrite(LEFT_B_PIN, leftForward ? 0 : leftSpeed);
+  analogWrite(RIGHT_F_PIN, rightForward ? 0 : rightSpeed);
+  analogWrite(RIGHT_B_PIN, rightForward ? rightSpeed : 0);
+}
+
+void forward(int speed = 50) {
+  moveCar(speed, true, speed, true);
+}
+
+void backward(int speed = 40) {
+  moveCar(speed, false, speed, false);
+}
+
+void turnLeft(int leftSpeed = 120, int rightSpeed = 200) {
+  moveCar(leftSpeed, false, rightSpeed, true);
+}
+
+void turnRight(int leftSpeed = 200, int rightSpeed = 120) {
+  moveCar(leftSpeed, true, rightSpeed, false);
+}
+
+void trackForward(int speed = TRACK_BASE_SPEED) {
+  moveCar(speed, true, speed, true);
+}
+
+void trackSmallLeft() {
+  moveCar(TRACK_SMALL_LEFT_L, false, TRACK_SMALL_LEFT_R, true);
+}
+
+void trackSmallRight() {
+  moveCar(TRACK_SMALL_RIGHT_L, true, TRACK_SMALL_RIGHT_R, false);
+}
+
+void trackLeft90() {
+  moveCar(TRACK_TURN_LEFT_L, false, TRACK_TURN_LEFT_R, true);
+}
+
+void trackRight90() {
+  moveCar(TRACK_TURN_RIGHT_L, true, TRACK_TURN_RIGHT_R, false);
+}
+
+void stopCar() {
+  analogWrite(LEFT_F_PIN, 0);
+  analogWrite(LEFT_B_PIN, 0);
+  analogWrite(RIGHT_F_PIN, 0);
+  analogWrite(RIGHT_B_PIN, 0);
+}
+
+// ==================== 核心工具函数 ====================
+float measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH, 20000);
+  float distance = duration > 0 ? (duration * 0.034 / 2) : 0;
+  return constrain(distance, 0, 400);
+}
+
+bool isTimeReached(unsigned long startTime, unsigned long targetTime) {
+  return millis() - startTime >= targetTime;
+}
+
+void setLedBrightness(int leftBright, int rightBright) {
+  analogWrite(LED_L, leftBright);
+  analogWrite(LED_R, rightBright);
+}
+
+void setBuzzer(int frequency, unsigned long duration = 0) {
+  if (frequency == 0) {
+    noTone(BUZZER_PIN);
+  } else if (duration == 0) {
+    tone(BUZZER_PIN, frequency);
+  } else {
+    tone(BUZZER_PIN, frequency, duration);
+  }
+}
+
+// ==================== 蓝牙车灯控制 ====================
+void ledToggleControl(char cmd) {
+  switch(cmd) {
+    case 'A':
+      state.leftLedState = !state.leftLedState;
+      setLedBrightness(state.leftLedState ? 255 : 0, state.rightLedState ? 255 : 0);
+      Serial.println(state.leftLedState ? "左灯已打开" : "左灯已关闭");
+      bluetoothSerial.println(state.leftLedState ? "OK:A_ON" : "OK:A_OFF");
+      break;
+    case 'B':
+      state.rightLedState = !state.rightLedState;
+      setLedBrightness(state.leftLedState ? 255 : 0, state.rightLedState ? 255 : 0);
+      Serial.println(state.rightLedState ? "右灯已打开" : "右灯已关闭");
+      bluetoothSerial.println(state.rightLedState ? "OK:B_ON" : "OK:B_OFF");
+      break;
+    case 'C':
+      state.bothLedState = !state.bothLedState;
+      state.leftLedState = state.bothLedState;
+      state.rightLedState = state.bothLedState;
+      setLedBrightness(state.bothLedState ? 255 : 0, state.bothLedState ? 255 : 0);
+      Serial.println(state.bothLedState ? "双灯已打开" : "双灯已关闭");
+      bluetoothSerial.println(state.bothLedState ? "OK:C_ON" : "OK:C_OFF");
+      break;
+  }
+  if (!state.isPlaying) setBuzzer(1000, 100);
+}
+
+// ==================== 《伯虎说》播放控制 ====================
+void playBohuShuo() {
+  if (state.isPlaying) {
+    if (isTimeReached(state.lastNoteTime, pgm_read_word(&bohuDurations[state.noteIndex]))) {
+      state.noteIndex++;
+      if (state.noteIndex >= BOHU_NOTE_COUNT) {
+        state.isPlaying = false;
+        state.noteIndex = 0;
+        setBuzzer(0);
+        Serial.println("伯虎说播放完毕");
+        bluetoothSerial.println("OK:BohuShuo_Finish");
+      } else {
+        int note = pgm_read_word(&bohuNotes[state.noteIndex]);
+        note == 0 ? setBuzzer(0) : setBuzzer(note);
+        state.lastNoteTime = millis();
+      }
+    }
+  } else {
+    setBuzzer(0);
+  }
+}
+
+// ==================== 蓝牙指令处理 ====================
+void processBluetoothCommand(char cmd) {
+  switch(cmd) {
+    case 'A': case 'B': case 'C':
+      ledToggleControl(cmd);
+      break;
+    case 'D':
+      state.isPlaying = !state.isPlaying;
+      if (state.isPlaying) {
+        state.noteIndex = 0;
+        state.lastNoteTime = millis();
+        int note = pgm_read_word(&bohuNotes[state.noteIndex]);
+        note != 0 ? setBuzzer(note) : setBuzzer(0);
+        Serial.println("伯虎说开始播放");
+        bluetoothSerial.println("OK:BohuShuo_Play");
+      } else {
+        setBuzzer(0);
+        Serial.println("伯虎说停止播放");
+        bluetoothSerial.println("OK:BohuShuo_Stop");
+      }
+      break;
+    case 'G': forward(); Serial.println("Forward"); break;
+    case 'K': backward(); Serial.println("Backward"); break;
+    case 'H': turnLeft(); Serial.println("TurnLeft"); break;
+    case 'J': turnRight(); Serial.println("TurnRight"); break;
+    case 'I': stopCar(); Serial.println("Stop"); break;
+    default:
+      if (!state.isPlaying) setBuzzer(500, 200);
+      Serial.println("Invalid command");
+      bluetoothSerial.println("OK:Invalid_Cmd");
+      break;
+  }
+}
+
+// ==================== 避障模式函数 ====================
+void checkLongDistanceMode() {
+  if (!state.isBackwardMode && !state.isLongDistanceMode) {
+    if (state.currentDistance >= 60) {
+      if (state.longModeTimer == 0) {
+        state.longModeTimer = millis();
+        Serial.println("长模式计时开始");
+      } else if (isTimeReached(state.longModeTimer, LONG_MODE_DUR)) {
+        state.isLongDistanceMode = true;
+        Serial.println("=== 切换：长距离模式 ===");
+      }
+    } else {
+      state.longModeTimer = 0;
+    }
+  }
+}
+
+void obstacleAvoidAction() {
+  if (isTimeReached(state.lastMeasureTime, 50)) {
+    state.currentDistance = measureDistance();
+    state.lastMeasureTime = millis();
+  }
+
+  if (!state.isBackwardMode) {
+    checkLongDistanceMode();
+  }
+
+  Serial.print("距离:");
+  Serial.print(state.currentDistance, 1);
+  Serial.print("cm | 模式:");
+  Serial.println(state.isLongDistanceMode ? "长距离" : "短距离");
+
+  if (state.isBackwardMode) {
+    if (isTimeReached(state.obstacleActionTime, 800)) {
+      stopCar();
+      delay(100);
+      turnLeft();
+      Serial.println("后退完成，开始左转");
+      state.obstacleActionTime = millis();
+      
+      while (!isTimeReached(state.obstacleActionTime, 300)) {
+        delay(10);
+      }
+      
+      stopCar();
+      state.isBackwardMode = false;
+      state.longModeTimer = 0;
+      state.isLongDistanceMode = false;
+      Serial.println("左转完成");
+    } else {
+      backward(50);
+    }
+  } 
+  else if (state.isLongDistanceMode) {
+    if (state.currentDistance > 30) {
+      forward(SHORT_SAFE_SPEED);
+      Serial.println("长模式：满速前进");
+    } else if (state.currentDistance > 0) {
+      state.isBackwardMode = true;
+      state.obstacleActionTime = millis();
+      backward(50);
+      Serial.print("长模式：后退 ");
+      Serial.print(state.currentDistance, 1);
+      Serial.println("cm");
+    }
+  } 
+  else {
+    if (state.currentDistance > 60) {
+      forward(SHORT_SAFE_SPEED);
+      Serial.println("短模式：满速前进");
+    } else if (state.currentDistance > 40) {
+      forward(SHORT_WARN_SPEED);
+      Serial.println("短模式：35速前进");
+    } else if (state.currentDistance > SHORT_EMERGENCY_DIST) {
+      forward(SHORT_ALERT_SPEED);
+      Serial.println("短模式：30速前进");
+    } else if (state.currentDistance <= SHORT_EMERGENCY_DIST && state.currentDistance > 0) {
+      state.isBackwardMode = true;
+      state.obstacleActionTime = millis();
+      backward(50);
+      Serial.println("短模式：紧急后退");
+    }
+  }
+}
+
+// ==================== 循迹模式函数 ====================
+void readSensors() {
+  // 使用局部变量存储传感器状态
+  int irL = digitalRead(irLeft);
+  int irML = digitalRead(irMiddleLeft);
+  int irMR = digitalRead(irMiddleRight);
+  int irR = digitalRead(irRight);
+
+  // 保存到状态结构
+  static int lastSensorState = 0;
+  int currentSensorState = (irL << 3) | (irML << 2) | (irMR << 1) | irR;
+  
+  if (currentSensorState != lastSensorState) {
+    lastSensorState = currentSensorState;
+    
+    // 检查90度转弯
+    if (!state.is90DegreeTurning) {
+      // 情况1：0011 -> 右转90度
+      if (irL == 0 && irML == 0 && irMR == 1 && irR == 1) {
+        state.is90DegreeTurning = true;
+        state.turn90Direction = 2;
+        state.turn90StartTime = millis();
+        Serial.println("检测到右转90度");
+        return;
+      }
+      
+      // 情况2：1100 -> 左转90度
+      if (irL == 1 && irML == 1 && irMR == 0 && irR == 0) {
+        state.is90DegreeTurning = true;
+        state.turn90Direction = 1;
+        state.turn90StartTime = millis();
+        Serial.println("检测到左转90度");
+        return;
+      }
+    }
+  }
+  
+  // 执行90度转弯
+  if (state.is90DegreeTurning) {
+    unsigned long elapsedTime = millis() - state.turn90StartTime;
+    
+    if (elapsedTime < TRACK_TURN_DURATION) {
+      if (state.turn90Direction == 1) {
+        trackLeft90();
+      } else if (state.turn90Direction == 2) {
+        trackRight90();
+      }
+    } else {
+      stopCar();
+      delay(100);
+      state.is90DegreeTurning = false;
+      state.turn90Direction = 0;
+      Serial.println("90度转弯完成");
+    }
+    return;
+  }
+  
+  // 正常循迹逻辑
+  if (irL == 1 && irML == 1 && irMR == 1 && irR == 1) {
+    stopCar();
+    Serial.println("停止（四白）");
+  }
+  else if (irL == 0 && irML == 0 && irMR == 0 && irR == 0) {
+    trackForward(TRACK_BASE_SPEED);
+    Serial.println("直行（四黑）");
+  }
+  else if (irL == 0 && irML == 1 && irMR == 0 && irR == 0) {
+    trackSmallLeft();
+    Serial.println("小幅度左转");
+  }
+  else if (irL == 0 && irML == 0 && irMR == 1 && irR == 0) {
+    trackSmallRight();
+    Serial.println("小幅度右转");
+  }
+  else {
+    stopCar();
+    Serial.println("停止");
+  }
+}
+
+void traceLogic() {
+  if (currentMode == TRACK_MODE) {
+    readSensors();
+  }
+}
+
+// ==================== 模式切换 ====================
+void checkModeSwitch() {
+  static unsigned long lastKeyTime = 0;
+  if (digitalRead(KEY1_PIN) == LOW && isTimeReached(lastKeyTime, 50)) {
+    // 切换到下一个模式
+    currentMode = static_cast<WorkMode>((currentMode + 1) % 3);
+    stopCar();
+    state.isPlaying = false;
+    setBuzzer(0);
+    setLedBrightness(0, 0);
+    state.leftLedState = false;
+    state.rightLedState = false;
+    state.bothLedState = false;
+    
+    // 重置避障模式标记
+    state.isBackwardMode = false;
+    state.longModeTimer = 0;
+    state.isLongDistanceMode = false;
+    
+    // 重置循迹模式标记
+    state.is90DegreeTurning = false;
+    state.turn90Direction = 0;
+    
+    // 提示音
+    setBuzzer(800, 100);
+    delay(50);
+    setBuzzer(1200, 100);
+    
+    if (currentMode == BLUETOOTH_MODE) {
+      Serial.println("模式切换：蓝牙控制模式");
+      MsTimer2::stop();
+    } else if (currentMode == OBSTACLE_AVOID_MODE) {
+      Serial.println("模式切换：超声波避障模式");
+      MsTimer2::stop();
+    } else if (currentMode == TRACK_MODE) {
+      Serial.println("模式切换：循迹模式");
+      MsTimer2::set(30, traceLogic);
+      MsTimer2::start();
+    }
+    
+    lastKeyTime = millis();
+    delay(200);
+  }
+}
+
+// ==================== 初始化 ====================
+void setup() {
+  Serial.begin(9600);
+  bluetoothSerial.begin(9600);
+  
+  // 电机引脚初始化
+  pinMode(LEFT_F_PIN, OUTPUT);
+  pinMode(LEFT_B_PIN, OUTPUT);
+  pinMode(RIGHT_F_PIN, OUTPUT);
+  pinMode(RIGHT_B_PIN, OUTPUT);
+  
+  // 超声波引脚
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // 其他引脚
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_L, OUTPUT);
+  pinMode(LED_R, OUTPUT);
+  pinMode(KEY1_PIN, INPUT_PULLUP);
+  
+  // 循迹传感器引脚
+  pinMode(irLeft, INPUT);
+  pinMode(irMiddleLeft, INPUT);
+  pinMode(irMiddleRight, INPUT);
+  pinMode(irRight, INPUT);
+  
+  // 初始化
+  stopCar();
+  setLedBrightness(0, 0);
+  setBuzzer(0);
+  
+  Serial.println("系统启动：蓝牙控制模式");
+  Serial.println("按键KEY1切换模式");
+  Serial.println("蓝牙指令：A左灯 B右灯 C双灯 D音乐 G前进 K后退 H左转 J右转 I停止");
+  
+  // 启动提示音
+  setBuzzer(1500, 100);
+  delay(100);
+  setBuzzer(2000, 100);
+}
+
+// ==================== 主循环 ====================
+void loop() {
+  checkModeSwitch();
+  
+  // 蓝牙模式处理
+  if (currentMode == BLUETOOTH_MODE) {
+    if (state.isPlaying) {
+      playBohuShuo();
+    }
+    
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c != '\n' && c != '\r') processBluetoothCommand(c);
+    }
+    if (bluetoothSerial.available()) {
+      char c = bluetoothSerial.read();
+      if (c != '\n' && c != '\r') processBluetoothCommand(c);
+    }
+  }
+  // 避障模式处理
+  else if (currentMode == OBSTACLE_AVOID_MODE) {
+    if (state.isPlaying) {
+      state.isPlaying = false;
+      setBuzzer(0);
+    }
+    obstacleAvoidAction();
+  }
+  // 循迹模式处理
+  else if (currentMode == TRACK_MODE) {
+    if (state.isPlaying) {
+      state.isPlaying = false;
+      setBuzzer(0);
+    }
+    // 循迹逻辑通过定时器中断执行
+  }
+  
+  delay(10);
+}
